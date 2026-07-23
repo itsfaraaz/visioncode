@@ -53,6 +53,18 @@ class FakeClaudeQuery implements AsyncIterable<SDKMessage> {
   }> = [];
   private done = false;
   private failure: unknown | undefined;
+  private readonly setPermissionModeFailures: ReadonlyArray<unknown | undefined>;
+  private readonly onSetPermissionMode:
+    | ((mode: PermissionMode, callIndex: number) => void | Promise<void>)
+    | undefined;
+
+  constructor(
+    setPermissionModeFailures: ReadonlyArray<unknown | undefined> = [],
+    onSetPermissionMode?: (mode: PermissionMode, callIndex: number) => void | Promise<void>,
+  ) {
+    this.setPermissionModeFailures = setPermissionModeFailures;
+    this.onSetPermissionMode = onSetPermissionMode;
+  }
 
   public readonly interruptCalls: Array<void> = [];
   public readonly setModelCalls: Array<string | undefined> = [];
@@ -103,7 +115,13 @@ class FakeClaudeQuery implements AsyncIterable<SDKMessage> {
   };
 
   readonly setPermissionMode = async (mode: PermissionMode): Promise<void> => {
+    const callIndex = this.setPermissionModeCalls.length;
     this.setPermissionModeCalls.push(mode);
+    await this.onSetPermissionMode?.(mode, callIndex);
+    const failure = this.setPermissionModeFailures[callIndex];
+    if (failure !== undefined) {
+      throw failure;
+    }
   };
 
   readonly setMaxThinkingTokens = async (maxThinkingTokens: number | null): Promise<void> => {
@@ -156,8 +174,10 @@ function makeHarness(config?: {
   readonly baseDir?: string;
   readonly claudeConfig?: Partial<ClaudeSettings>;
   readonly instanceId?: ProviderInstanceId;
+  readonly setPermissionModeFailures?: ReadonlyArray<unknown | undefined>;
+  readonly onSetPermissionMode?: (mode: PermissionMode, callIndex: number) => void | Promise<void>;
 }) {
-  const query = new FakeClaudeQuery();
+  const query = new FakeClaudeQuery(config?.setPermissionModeFailures, config?.onSetPermissionMode);
   let createInput:
     | {
         readonly prompt: AsyncIterable<SDKUserMessage>;
@@ -266,6 +286,8 @@ async function readFirstPromptMessage(
 
 const THREAD_ID = ThreadId.make("thread-claude-1");
 const RESUME_THREAD_ID = ThreadId.make("thread-claude-resume");
+const BYPASS_PERMISSIONS_DISABLED_MESSAGE =
+  "Cannot set permission mode to bypassPermissions because it is disabled by settings or configuration";
 
 describe("ClaudeAdapterLive", () => {
   it.effect("returns validation error for non-claude provider on startSession", () => {
@@ -350,6 +372,7 @@ describe("ClaudeAdapterLive", () => {
       assert.deepEqual(createInput?.options.settingSources, ["user", "project", "local"]);
       assert.equal(createInput?.options.permissionMode, "bypassPermissions");
       assert.equal(createInput?.options.allowDangerouslySkipPermissions, true);
+      assert.deepEqual(harness.query.setPermissionModeCalls, ["bypassPermissions"]);
     }).pipe(
       Effect.provideService(Random.Random, makeDeterministicRandomService()),
       Effect.provide(harness.layer),
@@ -376,11 +399,12 @@ describe("ClaudeAdapterLive", () => {
     );
   });
 
-  it.effect("uses bypass permissions for full-access claude sessions", () => {
-    const harness = makeHarness();
+  it.effect("falls back to default when the full-access probe is disabled", () => {
+    const disabledError = new Error(BYPASS_PERMISSIONS_DISABLED_MESSAGE);
+    const harness = makeHarness({ setPermissionModeFailures: [disabledError] });
     return Effect.gen(function* () {
       const adapter = yield* ClaudeAdapter;
-      yield* adapter.startSession({
+      const session = yield* adapter.startSession({
         threadId: THREAD_ID,
         provider: ProviderDriverKind.make("claudeAgent"),
         runtimeMode: "full-access",
@@ -389,6 +413,174 @@ describe("ClaudeAdapterLive", () => {
       const createInput = harness.getLastCreateQueryInput();
       assert.equal(createInput?.options.permissionMode, "bypassPermissions");
       assert.equal(createInput?.options.allowDangerouslySkipPermissions, true);
+      assert.deepEqual(harness.query.setPermissionModeCalls, ["bypassPermissions", "default"]);
+
+      yield* adapter.sendTurn({
+        threadId: session.threadId,
+        input: "continue without retrying bypass",
+        interactionMode: "default",
+        attachments: [],
+      });
+
+      assert.deepEqual(harness.query.setPermissionModeCalls, [
+        "bypassPermissions",
+        "default",
+        "default",
+      ]);
+    }).pipe(
+      Effect.provideService(Random.Random, makeDeterministicRandomService()),
+      Effect.provide(harness.layer),
+    );
+  });
+
+  it.effect("waits for startup fallback state before resolving permission callbacks", () => {
+    let permissionPromise: Promise<PermissionResult> | undefined;
+    let harness: ReturnType<typeof makeHarness>;
+    harness = makeHarness({
+      setPermissionModeFailures: [new Error(BYPASS_PERMISSIONS_DISABLED_MESSAGE)],
+      onSetPermissionMode: (_mode, callIndex) => {
+        if (callIndex !== 0) return;
+
+        const canUseTool = harness.getLastCreateQueryInput()?.options.canUseTool;
+        assert.equal(typeof canUseTool, "function");
+        if (!canUseTool) return;
+
+        permissionPromise = canUseTool(
+          "Bash",
+          { command: "pwd" },
+          {
+            signal: new AbortController().signal,
+            toolUseID: "tool-startup-fallback-race",
+          },
+        );
+      },
+    });
+
+    return Effect.gen(function* () {
+      const adapter = yield* ClaudeAdapter;
+      yield* adapter.startSession({
+        threadId: THREAD_ID,
+        provider: ProviderDriverKind.make("claudeAgent"),
+        runtimeMode: "full-access",
+      });
+
+      assert.exists(permissionPromise);
+      const startupPermissionPromise = permissionPromise;
+      if (!startupPermissionPromise) return;
+      const permissionResult = yield* Effect.promise(() => startupPermissionPromise);
+      assert.deepEqual(permissionResult, {
+        behavior: "allow",
+        updatedInput: { command: "pwd" },
+        decisionClassification: "user_temporary",
+      });
+    }).pipe(
+      Effect.provideService(Random.Random, makeDeterministicRandomService()),
+      Effect.provide(harness.layer),
+    );
+  });
+
+  it.effect("cleans up the query and releases callbacks when startup is interrupted", () => {
+    let permissionPromise: Promise<PermissionResult> | undefined;
+    let signalProbeStarted: (() => void) | undefined;
+    const probeStarted = new Promise<void>((resolve) => {
+      signalProbeStarted = resolve;
+    });
+    let harness: ReturnType<typeof makeHarness>;
+    harness = makeHarness({
+      onSetPermissionMode: (_mode, callIndex) => {
+        if (callIndex !== 0) return;
+
+        const canUseTool = harness.getLastCreateQueryInput()?.options.canUseTool;
+        assert.equal(typeof canUseTool, "function");
+        if (canUseTool) {
+          permissionPromise = canUseTool(
+            "Bash",
+            { command: "pwd" },
+            {
+              signal: new AbortController().signal,
+              toolUseID: "tool-interrupted-startup",
+            },
+          );
+        }
+        signalProbeStarted?.();
+        return new Promise<void>(() => undefined);
+      },
+    });
+
+    return Effect.gen(function* () {
+      const adapter = yield* ClaudeAdapter;
+      const startFiber = yield* adapter
+        .startSession({
+          threadId: THREAD_ID,
+          provider: ProviderDriverKind.make("claudeAgent"),
+          runtimeMode: "full-access",
+        })
+        .pipe(Effect.forkChild);
+
+      yield* Effect.promise(() => probeStarted);
+      yield* Fiber.interrupt(startFiber);
+
+      assert.equal(harness.query.closeCalls, 1);
+      assert.exists(permissionPromise);
+      const startupPermissionPromise = permissionPromise;
+      if (!startupPermissionPromise) return;
+      assert.deepEqual(yield* Effect.promise(() => startupPermissionPromise), {
+        behavior: "deny",
+        message: "Claude session permission mode initialization failed.",
+      });
+    }).pipe(
+      Effect.provideService(Random.Random, makeDeterministicRandomService()),
+      Effect.provide(harness.layer),
+    );
+  });
+
+  it.effect.each([
+    new Error("unexpected permission control failure"),
+    new Error(
+      "Cannot set permission mode to bypassPermissions because session was not launched with --dangerously-skip-permissions",
+    ),
+  ])("keeps non-policy full-access probe errors fatal: %s", (probeError) => {
+    const harness = makeHarness({ setPermissionModeFailures: [probeError] });
+    return Effect.gen(function* () {
+      const adapter = yield* ClaudeAdapter;
+      const error = yield* adapter
+        .startSession({
+          threadId: THREAD_ID,
+          provider: ProviderDriverKind.make("claudeAgent"),
+          runtimeMode: "full-access",
+        })
+        .pipe(Effect.flip);
+
+      assert.instanceOf(error, ProviderAdapterProcessError);
+      assert.strictEqual(error.cause, probeError);
+      assert.deepEqual(harness.query.setPermissionModeCalls, ["bypassPermissions"]);
+      assert.equal(harness.query.closeCalls, 1);
+    }).pipe(
+      Effect.provideService(Random.Random, makeDeterministicRandomService()),
+      Effect.provide(harness.layer),
+    );
+  });
+
+  it.effect("closes the query when the default fallback also fails", () => {
+    const disabledError = new Error(BYPASS_PERMISSIONS_DISABLED_MESSAGE);
+    const fallbackError = new Error("default permission mode control failed");
+    const harness = makeHarness({
+      setPermissionModeFailures: [disabledError, fallbackError],
+    });
+    return Effect.gen(function* () {
+      const adapter = yield* ClaudeAdapter;
+      const error = yield* adapter
+        .startSession({
+          threadId: THREAD_ID,
+          provider: ProviderDriverKind.make("claudeAgent"),
+          runtimeMode: "full-access",
+        })
+        .pipe(Effect.flip);
+
+      assert.instanceOf(error, ProviderAdapterProcessError);
+      assert.strictEqual(error.cause, fallbackError);
+      assert.deepEqual(harness.query.setPermissionModeCalls, ["bypassPermissions", "default"]);
+      assert.equal(harness.query.closeCalls, 1);
     }).pipe(
       Effect.provideService(Random.Random, makeDeterministicRandomService()),
       Effect.provide(harness.layer),
@@ -2840,6 +3032,195 @@ describe("ClaudeAdapterLive", () => {
     );
   });
 
+  it.effect("auto-allows fallback callbacks without emitting approval requests", () => {
+    const harness = makeHarness({
+      setPermissionModeFailures: [new Error(BYPASS_PERMISSIONS_DISABLED_MESSAGE)],
+    });
+    return Effect.gen(function* () {
+      const adapter = yield* ClaudeAdapter;
+      yield* adapter.startSession({
+        threadId: THREAD_ID,
+        provider: ProviderDriverKind.make("claudeAgent"),
+        runtimeMode: "full-access",
+      });
+      yield* Stream.take(adapter.streamEvents, 3).pipe(Stream.runDrain);
+
+      const canUseTool = harness.getLastCreateQueryInput()?.options.canUseTool;
+      assert.equal(typeof canUseTool, "function");
+      if (!canUseTool) return;
+
+      const unexpectedEventFiber = yield* Stream.runHead(adapter.streamEvents).pipe(
+        Effect.forkChild,
+      );
+      const permissionResult = yield* Effect.promise(() =>
+        canUseTool(
+          "Bash",
+          { command: "pwd" },
+          {
+            signal: new AbortController().signal,
+            toolUseID: "tool-fallback-no-suggestion",
+          },
+        ),
+      );
+
+      assert.deepEqual(permissionResult, {
+        behavior: "allow",
+        updatedInput: { command: "pwd" },
+        decisionClassification: "user_temporary",
+      });
+      yield* Effect.yieldNow;
+      assert.equal(unexpectedEventFiber.pollUnsafe(), undefined);
+      unexpectedEventFiber.interruptUnsafe();
+    }).pipe(
+      Effect.provideService(Random.Random, makeDeterministicRandomService()),
+      Effect.provide(harness.layer),
+    );
+  });
+
+  it.effect("applies only session suggestions to command-classified fallback callbacks", () => {
+    const harness = makeHarness({
+      setPermissionModeFailures: [new Error(BYPASS_PERMISSIONS_DISABLED_MESSAGE)],
+    });
+    return Effect.gen(function* () {
+      const adapter = yield* ClaudeAdapter;
+      yield* adapter.startSession({
+        threadId: THREAD_ID,
+        provider: ProviderDriverKind.make("claudeAgent"),
+        runtimeMode: "full-access",
+      });
+      yield* Stream.take(adapter.streamEvents, 3).pipe(Stream.runDrain);
+
+      const canUseTool = harness.getLastCreateQueryInput()?.options.canUseTool;
+      assert.equal(typeof canUseTool, "function");
+      if (!canUseTool) return;
+
+      const sessionSuggestion = {
+        type: "setMode" as const,
+        mode: "default" as const,
+        destination: "session" as const,
+      };
+      const persistentSuggestion = {
+        type: "setMode" as const,
+        mode: "acceptEdits" as const,
+        destination: "localSettings" as const,
+      };
+
+      for (const [index, toolName] of [
+        "Bash",
+        "ShellCommand",
+        "Terminal",
+        "run_command",
+      ].entries()) {
+        const input = { command: `command-${index}` };
+        const permissionResult = yield* Effect.promise(() =>
+          canUseTool(toolName, input, {
+            signal: new AbortController().signal,
+            suggestions: [persistentSuggestion, sessionSuggestion],
+            toolUseID: `tool-fallback-command-${index}`,
+          }),
+        );
+
+        assert.deepEqual(permissionResult, {
+          behavior: "allow",
+          updatedInput: input,
+          updatedPermissions: [sessionSuggestion],
+          decisionClassification: "user_permanent",
+        });
+      }
+    }).pipe(
+      Effect.provideService(Random.Random, makeDeterministicRandomService()),
+      Effect.provide(harness.layer),
+    );
+  });
+
+  it.effect("does not remember fallback suggestions for non-command tools", () => {
+    const harness = makeHarness({
+      setPermissionModeFailures: [new Error(BYPASS_PERMISSIONS_DISABLED_MESSAGE)],
+    });
+    return Effect.gen(function* () {
+      const adapter = yield* ClaudeAdapter;
+      yield* adapter.startSession({
+        threadId: THREAD_ID,
+        provider: ProviderDriverKind.make("claudeAgent"),
+        runtimeMode: "full-access",
+      });
+
+      const canUseTool = harness.getLastCreateQueryInput()?.options.canUseTool;
+      assert.equal(typeof canUseTool, "function");
+      if (!canUseTool) return;
+
+      const input = { file_path: "/tmp/example.ts", content: "export {};" };
+      const permissionResult = yield* Effect.promise(() =>
+        canUseTool("Write", input, {
+          signal: new AbortController().signal,
+          suggestions: [
+            {
+              type: "setMode",
+              mode: "default",
+              destination: "session",
+            },
+          ],
+          toolUseID: "tool-fallback-write",
+        }),
+      );
+
+      assert.deepEqual(permissionResult, {
+        behavior: "allow",
+        updatedInput: input,
+        decisionClassification: "user_temporary",
+      });
+    }).pipe(
+      Effect.provideService(Random.Random, makeDeterministicRandomService()),
+      Effect.provide(harness.layer),
+    );
+  });
+
+  it.effect("keeps normal approval flow when the full-access fallback is inactive", () => {
+    const harness = makeHarness();
+    return Effect.gen(function* () {
+      const adapter = yield* ClaudeAdapter;
+      const session = yield* adapter.startSession({
+        threadId: THREAD_ID,
+        provider: ProviderDriverKind.make("claudeAgent"),
+        runtimeMode: "full-access",
+      });
+      yield* Stream.take(adapter.streamEvents, 3).pipe(Stream.runDrain);
+
+      const canUseTool = harness.getLastCreateQueryInput()?.options.canUseTool;
+      assert.equal(typeof canUseTool, "function");
+      if (!canUseTool) return;
+
+      const permissionPromise = canUseTool(
+        "Bash",
+        { command: "pwd" },
+        {
+          signal: new AbortController().signal,
+          toolUseID: "tool-full-access-no-fallback",
+        },
+      );
+      const requested = yield* Stream.runHead(adapter.streamEvents);
+      assert.equal(requested._tag, "Some");
+      if (requested._tag !== "Some" || requested.value.type !== "request.opened") return;
+      assert.equal(requested.value.payload.requestType, "command_execution_approval");
+
+      yield* adapter.respondToRequest(
+        session.threadId,
+        ApprovalRequestId.make(String(requested.value.requestId)),
+        "accept",
+      );
+      const resolved = yield* Stream.runHead(adapter.streamEvents);
+      assert.equal(resolved._tag, "Some");
+      if (resolved._tag === "Some") {
+        assert.equal(resolved.value.type, "request.resolved");
+      }
+      const permissionResult = yield* Effect.promise(() => permissionPromise);
+      assert.equal(permissionResult.behavior, "allow");
+    }).pipe(
+      Effect.provideService(Random.Random, makeDeterministicRandomService()),
+      Effect.provide(harness.layer),
+    );
+  });
+
   it.effect("classifies Agent tools and read-only Claude tools correctly for approvals", () => {
     const harness = makeHarness();
     return Effect.gen(function* () {
@@ -3302,7 +3683,7 @@ describe("ClaudeAdapterLive", () => {
         attachments: [],
       });
 
-      assert.deepEqual(harness.query.setPermissionModeCalls, ["plan"]);
+      assert.deepEqual(harness.query.setPermissionModeCalls, ["bypassPermissions", "plan"]);
     }).pipe(
       Effect.provideService(Random.Random, makeDeterministicRandomService()),
       Effect.provide(harness.layer),
@@ -3359,7 +3740,11 @@ describe("ClaudeAdapterLive", () => {
           attachments: [],
         });
 
-        assert.deepEqual(harness.query.setPermissionModeCalls, ["plan", expectedBase]);
+        assert.deepEqual(harness.query.setPermissionModeCalls, [
+          ...(runtimeMode === "full-access" ? ["bypassPermissions"] : []),
+          "plan",
+          expectedBase,
+        ]);
       }).pipe(
         Effect.provideService(Random.Random, makeDeterministicRandomService()),
         Effect.provide(harness.layer),
@@ -3367,31 +3752,164 @@ describe("ClaudeAdapterLive", () => {
     },
   );
 
-  it.effect("does not call setPermissionMode when interactionMode is absent", () => {
-    const harness = makeHarness();
+  it.effect("restores default after a plan turn when startup fallback is active", () => {
+    const harness = makeHarness({
+      setPermissionModeFailures: [new Error(BYPASS_PERMISSIONS_DISABLED_MESSAGE)],
+    });
     return Effect.gen(function* () {
       const adapter = yield* ClaudeAdapter;
-
       const session = yield* adapter.startSession({
         threadId: THREAD_ID,
         provider: ProviderDriverKind.make("claudeAgent"),
         runtimeMode: "full-access",
       });
+
       yield* adapter.sendTurn({
         threadId: session.threadId,
-        input: "hello",
+        input: "plan this",
+        interactionMode: "plan",
         attachments: [],
       });
 
-      assert.deepEqual(harness.query.setPermissionModeCalls, []);
+      const completedFiber = yield* Stream.filter(
+        adapter.streamEvents,
+        (event) => event.type === "turn.completed",
+      ).pipe(Stream.runHead, Effect.forkChild);
+      harness.query.emit({
+        type: "result",
+        subtype: "success",
+        is_error: false,
+        errors: [],
+        session_id: "sdk-session-startup-fallback-plan",
+        uuid: "result-startup-fallback-plan",
+      } as unknown as SDKMessage);
+      yield* Fiber.join(completedFiber);
+
+      yield* adapter.sendTurn({
+        threadId: session.threadId,
+        input: "now do it",
+        interactionMode: "default",
+        attachments: [],
+      });
+
+      assert.deepEqual(harness.query.setPermissionModeCalls, [
+        "bypassPermissions",
+        "default",
+        "plan",
+        "default",
+      ]);
     }).pipe(
       Effect.provideService(Random.Random, makeDeterministicRandomService()),
       Effect.provide(harness.layer),
     );
   });
 
-  it.effect("captures ExitPlanMode as a proposed plan and denies auto-exit", () => {
-    const harness = makeHarness();
+  it.effect("keeps restoring default after bypass becomes disabled mid-session", () => {
+    const disabledError = new Error(BYPASS_PERMISSIONS_DISABLED_MESSAGE);
+    const harness = makeHarness({
+      setPermissionModeFailures: [undefined, undefined, disabledError],
+    });
+    return Effect.gen(function* () {
+      const adapter = yield* ClaudeAdapter;
+      const session = yield* adapter.startSession({
+        threadId: THREAD_ID,
+        provider: ProviderDriverKind.make("claudeAgent"),
+        runtimeMode: "full-access",
+      });
+      let completionIndex = 0;
+      const completeTurn = () =>
+        Effect.gen(function* () {
+          const completedFiber = yield* Stream.filter(
+            adapter.streamEvents,
+            (event) => event.type === "turn.completed",
+          ).pipe(Stream.runHead, Effect.forkChild);
+          const suffix = completionIndex++;
+          harness.query.emit({
+            type: "result",
+            subtype: "success",
+            is_error: false,
+            errors: [],
+            session_id: `sdk-session-mid-session-fallback-${suffix}`,
+            uuid: `result-mid-session-fallback-${suffix}`,
+          } as unknown as SDKMessage);
+          yield* Fiber.join(completedFiber);
+        });
+
+      yield* adapter.sendTurn({
+        threadId: session.threadId,
+        input: "plan first",
+        interactionMode: "plan",
+        attachments: [],
+      });
+      yield* completeTurn();
+
+      yield* adapter.sendTurn({
+        threadId: session.threadId,
+        input: "restore full access",
+        interactionMode: "default",
+        attachments: [],
+      });
+      yield* completeTurn();
+
+      yield* adapter.sendTurn({
+        threadId: session.threadId,
+        input: "plan again",
+        interactionMode: "plan",
+        attachments: [],
+      });
+      yield* completeTurn();
+
+      yield* adapter.sendTurn({
+        threadId: session.threadId,
+        input: "restore the remembered fallback",
+        interactionMode: "default",
+        attachments: [],
+      });
+
+      assert.deepEqual(harness.query.setPermissionModeCalls, [
+        "bypassPermissions",
+        "plan",
+        "bypassPermissions",
+        "default",
+        "plan",
+        "default",
+      ]);
+    }).pipe(
+      Effect.provideService(Random.Random, makeDeterministicRandomService()),
+      Effect.provide(harness.layer),
+    );
+  });
+
+  it.effect(
+    "does not change permission mode after the startup probe when interactionMode is absent",
+    () => {
+      const harness = makeHarness();
+      return Effect.gen(function* () {
+        const adapter = yield* ClaudeAdapter;
+
+        const session = yield* adapter.startSession({
+          threadId: THREAD_ID,
+          provider: ProviderDriverKind.make("claudeAgent"),
+          runtimeMode: "full-access",
+        });
+        yield* adapter.sendTurn({
+          threadId: session.threadId,
+          input: "hello",
+          attachments: [],
+        });
+
+        assert.deepEqual(harness.query.setPermissionModeCalls, ["bypassPermissions"]);
+      }).pipe(
+        Effect.provideService(Random.Random, makeDeterministicRandomService()),
+        Effect.provide(harness.layer),
+      );
+    },
+  );
+
+  it.effect("captures ExitPlanMode while the full-access fallback is active", () => {
+    const harness = makeHarness({
+      setPermissionModeFailures: [new Error(BYPASS_PERMISSIONS_DISABLED_MESSAGE)],
+    });
     return Effect.gen(function* () {
       const adapter = yield* ClaudeAdapter;
 
@@ -3681,12 +4199,14 @@ describe("ClaudeAdapterLive", () => {
   });
 
   it.effect("routes AskUserQuestion through user-input flow even in full-access mode", () => {
-    const harness = makeHarness();
+    const harness = makeHarness({
+      setPermissionModeFailures: [new Error(BYPASS_PERMISSIONS_DISABLED_MESSAGE)],
+    });
     return Effect.gen(function* () {
       const adapter = yield* ClaudeAdapter;
 
-      // In full-access mode, regular tools are auto-approved.
-      // AskUserQuestion should still go through the user-input flow.
+      // Regular tools are auto-approved while the fallback is active, but
+      // AskUserQuestion must still go through the user-input flow.
       const session = yield* adapter.startSession({
         threadId: THREAD_ID,
         provider: ProviderDriverKind.make("claudeAgent"),

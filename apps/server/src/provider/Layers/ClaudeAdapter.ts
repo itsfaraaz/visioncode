@@ -63,7 +63,7 @@ import * as FileSystem from "effect/FileSystem";
 import * as Fiber from "effect/Fiber";
 import * as Path from "effect/Path";
 import * as Queue from "effect/Queue";
-import * as Ref from "effect/Ref";
+import * as Result from "effect/Result";
 import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
 
@@ -94,6 +94,12 @@ const encodeUnknownJsonStringExit = Schema.encodeUnknownExit(Schema.UnknownFromJ
 const decodeUnknownJsonStringExit = Schema.decodeUnknownExit(Schema.UnknownFromJsonString);
 
 const PROVIDER = ProviderDriverKind.make("claudeAgent");
+const BYPASS_PERMISSIONS_UNAVAILABLE_MESSAGE =
+  "Cannot set permission mode to bypassPermissions because it is disabled by settings or configuration";
+const PERMISSION_MODE_CONTROL_TIMEOUT_MS = 30_000;
+
+type ClaudeFullAccessFallback = "inactive" | "bypass-unavailable-by-settings-or-configuration";
+type ClaudePermissionModeReadiness = "ready" | "failed";
 type ClaudeTextStreamKind = Extract<RuntimeContentStreamKind, "assistant_text" | "reasoning_text">;
 type ClaudeToolResultStreamKind = Extract<
   RuntimeContentStreamKind,
@@ -185,6 +191,9 @@ interface ClaudeSessionContext {
   streamFiber: Fiber.Fiber<void, Error> | undefined;
   readonly startedAt: string;
   readonly basePermissionMode: PermissionMode | undefined;
+  effectiveBasePermissionMode: PermissionMode | undefined;
+  fullAccessFallback: ClaudeFullAccessFallback;
+  readonly permissionModeReadiness: Deferred.Deferred<ClaudePermissionModeReadiness>;
   currentApiModelId: string | undefined;
   resumeSessionId: string | undefined;
   readonly pendingApprovals: Map<ApprovalRequestId, PendingApproval>;
@@ -212,6 +221,24 @@ interface ClaudeQueryRuntime extends AsyncIterable<SDKMessage> {
   readonly getContextUsage?: () => Promise<SDKControlGetContextUsageResponse>;
   readonly close: () => void;
 }
+
+class ClaudePermissionModeControlError extends Schema.TaggedErrorClass<ClaudePermissionModeControlError>()(
+  "ClaudePermissionModeControlError",
+  {
+    cause: Schema.Defect(),
+  },
+) {}
+const isClaudePermissionModeControlError = Schema.is(ClaudePermissionModeControlError);
+
+const attemptSetPermissionMode = Effect.fn("ClaudeAdapter.attemptSetPermissionMode")(function* (
+  queryRuntime: ClaudeQueryRuntime,
+  mode: PermissionMode,
+) {
+  return yield* Effect.tryPromise({
+    try: () => queryRuntime.setPermissionMode(mode),
+    catch: (cause) => new ClaudePermissionModeControlError({ cause }),
+  }).pipe(Effect.timeout(PERMISSION_MODE_CONTROL_TIMEOUT_MS), Effect.result);
+});
 
 export interface ClaudeAdapterLiveOptions {
   readonly instanceId?: ProviderInstanceId;
@@ -249,6 +276,14 @@ function toMessage(cause: unknown, fallback: string): string {
     return cause.message;
   }
   return fallback;
+}
+
+function isBypassPermissionsUnavailableBySettingsOrConfiguration(cause: unknown): cause is Error {
+  return cause instanceof Error && cause.message === BYPASS_PERMISSIONS_UNAVAILABLE_MESSAGE;
+}
+
+function permissionModeControlFailureCause(cause: unknown): unknown {
+  return isClaudePermissionModeControlError(cause) ? cause.cause : cause;
 }
 
 function normalizeClaudeStreamMessages(
@@ -3031,6 +3066,7 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
     if (context.stopped) return;
 
     context.stopped = true;
+    yield* Deferred.succeed(context.permissionModeReadiness, "failed").pipe(Effect.ignore);
 
     for (const [requestId, pending] of context.pendingApprovals) {
       yield* Deferred.succeed(pending.decision, "cancel");
@@ -3191,7 +3227,8 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
       const inFlightTools = new Map<number, ToolInFlight>();
       const claudeTasks = new Map<string, ClaudeTaskState>();
 
-      const contextRef = yield* Ref.make<ClaudeSessionContext | undefined>(undefined);
+      const contextReady = yield* Deferred.make<ClaudeSessionContext>();
+      const permissionModeReadiness = yield* Deferred.make<ClaudePermissionModeReadiness>();
 
       /**
        * Handle AskUserQuestion tool calls by emitting a `user-input.requested`
@@ -3330,11 +3367,12 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
         toolInput: Parameters<CanUseTool>[1],
         callbackOptions: Parameters<CanUseTool>[2],
       ) {
-        const context = yield* Ref.get(contextRef);
-        if (!context) {
+        const context = yield* Deferred.await(contextReady);
+        const permissionReadiness = yield* Deferred.await(context.permissionModeReadiness);
+        if (permissionReadiness === "failed") {
           return {
             behavior: "deny",
-            message: "Claude session context is unavailable.",
+            message: "Claude session permission mode initialization failed.",
           } satisfies PermissionResult;
         }
 
@@ -3368,10 +3406,26 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
         }
 
         const runtimeMode = input.runtimeMode ?? "full-access";
-        if (runtimeMode === "full-access") {
+        if (
+          runtimeMode === "full-access" &&
+          context.fullAccessFallback === "bypass-unavailable-by-settings-or-configuration"
+        ) {
+          const requestType = classifyRequestType(toolName);
+          const sessionSuggestions =
+            requestType === "command_execution_approval"
+              ? (callbackOptions.suggestions ?? []).filter(
+                  (suggestion) => suggestion.destination === "session",
+                )
+              : [];
           return {
             behavior: "allow",
             updatedInput: toolInput,
+            ...(sessionSuggestions.length > 0
+              ? {
+                  updatedPermissions: [...sessionSuggestions],
+                  decisionClassification: "user_permanent" as const,
+                }
+              : { decisionClassification: "user_temporary" as const }),
           } satisfies PermissionResult;
         }
 
@@ -3624,6 +3678,9 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
         streamFiber: undefined,
         startedAt,
         basePermissionMode: permissionMode,
+        effectiveBasePermissionMode: permissionMode,
+        fullAccessFallback: "inactive",
+        permissionModeReadiness,
         currentApiModelId: apiModelId,
         resumeSessionId: sessionId,
         pendingApprovals,
@@ -3639,51 +3696,108 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
         lastThreadStartedId: undefined,
         stopped: false,
       };
-      yield* Ref.set(contextRef, context);
-      sessions.set(threadId, context);
+      yield* Deferred.succeed(contextReady, context);
 
-      const sessionStartedStamp = yield* makeEventStamp();
-      yield* offerRuntimeEvent({
-        type: "session.started",
-        eventId: sessionStartedStamp.eventId,
-        provider: PROVIDER,
-        createdAt: sessionStartedStamp.createdAt,
-        threadId,
-        payload: input.resumeCursor !== undefined ? { resume: input.resumeCursor } : {},
-        providerRefs: {},
-      });
+      yield* Effect.gen(function* () {
+        if (permissionMode === "bypassPermissions") {
+          const probeResult = yield* attemptSetPermissionMode(queryRuntime, "bypassPermissions");
+          if (Result.isFailure(probeResult)) {
+            const probeFailureCause = permissionModeControlFailureCause(probeResult.failure);
+            if (!isBypassPermissionsUnavailableBySettingsOrConfiguration(probeFailureCause)) {
+              return yield* new ProviderAdapterProcessError({
+                provider: PROVIDER,
+                threadId,
+                detail: "Failed to configure Claude permission mode.",
+                cause: probeFailureCause,
+              });
+            }
 
-      const configuredStamp = yield* makeEventStamp();
-      yield* offerRuntimeEvent({
-        type: "session.configured",
-        eventId: configuredStamp.eventId,
-        provider: PROVIDER,
-        createdAt: configuredStamp.createdAt,
-        threadId,
-        payload: {
-          config: {
-            ...(apiModelId ? { model: apiModelId } : {}),
-            ...(input.cwd ? { cwd: input.cwd } : {}),
-            ...(effectiveEffort ? { effort: effectiveEffort } : {}),
-            ...(permissionMode ? { permissionMode } : {}),
-            ...(fastMode ? { fastMode: true } : {}),
+            const fallbackResult = yield* attemptSetPermissionMode(queryRuntime, "default");
+            if (Result.isFailure(fallbackResult)) {
+              return yield* new ProviderAdapterProcessError({
+                provider: PROVIDER,
+                threadId,
+                detail: "Failed to configure Claude permission mode fallback.",
+                cause: permissionModeControlFailureCause(fallbackResult.failure),
+              });
+            }
+
+            context.effectiveBasePermissionMode = "default";
+            context.fullAccessFallback = "bypass-unavailable-by-settings-or-configuration";
+            yield* Effect.logWarning("claude.permission.bypass-unavailable-host-fallback", {
+              threadId,
+              requestedPermissionMode: "bypassPermissions",
+              effectivePermissionMode: "default",
+            });
+          }
+        }
+
+        sessions.set(threadId, context);
+
+        const sessionStartedStamp = yield* makeEventStamp();
+        yield* offerRuntimeEvent({
+          type: "session.started",
+          eventId: sessionStartedStamp.eventId,
+          provider: PROVIDER,
+          createdAt: sessionStartedStamp.createdAt,
+          threadId,
+          payload: input.resumeCursor !== undefined ? { resume: input.resumeCursor } : {},
+          providerRefs: {},
+        });
+
+        const configuredStamp = yield* makeEventStamp();
+        yield* offerRuntimeEvent({
+          type: "session.configured",
+          eventId: configuredStamp.eventId,
+          provider: PROVIDER,
+          createdAt: configuredStamp.createdAt,
+          threadId,
+          payload: {
+            config: {
+              ...(apiModelId ? { model: apiModelId } : {}),
+              ...(input.cwd ? { cwd: input.cwd } : {}),
+              ...(effectiveEffort ? { effort: effectiveEffort } : {}),
+              ...(context.effectiveBasePermissionMode
+                ? { permissionMode: context.effectiveBasePermissionMode }
+                : {}),
+              ...(fastMode ? { fastMode: true } : {}),
+            },
           },
-        },
-        providerRefs: {},
-      });
+          providerRefs: {},
+        });
 
-      const readyStamp = yield* makeEventStamp();
-      yield* offerRuntimeEvent({
-        type: "session.state.changed",
-        eventId: readyStamp.eventId,
-        provider: PROVIDER,
-        createdAt: readyStamp.createdAt,
-        threadId,
-        payload: {
-          state: "ready",
-        },
-        providerRefs: {},
-      });
+        const readyStamp = yield* makeEventStamp();
+        yield* offerRuntimeEvent({
+          type: "session.state.changed",
+          eventId: readyStamp.eventId,
+          provider: PROVIDER,
+          createdAt: readyStamp.createdAt,
+          threadId,
+          payload: {
+            state: "ready",
+          },
+          providerRefs: {},
+        });
+        yield* Deferred.succeed(permissionModeReadiness, "ready");
+      }).pipe(
+        Effect.onExit((exit) => {
+          if (Exit.isSuccess(exit)) {
+            return Effect.void;
+          }
+          if (sessions.get(threadId) === context) {
+            sessions.delete(threadId);
+          }
+          context.stopped = true;
+          return Effect.all(
+            [
+              Deferred.succeed(permissionModeReadiness, "failed").pipe(Effect.ignore),
+              Queue.shutdown(promptQueue),
+              Effect.sync(() => queryRuntime.close()).pipe(Effect.ignoreCause({ log: true })),
+            ],
+            { concurrency: "unbounded" },
+          ).pipe(Effect.asVoid);
+        }),
+      );
 
       let streamFiber: Fiber.Fiber<void, never>;
       streamFiber = runFork(
@@ -3715,6 +3829,48 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
       };
     },
   );
+
+  const restoreBasePermissionMode = Effect.fn("ClaudeAdapter.restoreBasePermissionMode")(function* (
+    context: ClaudeSessionContext,
+  ) {
+    const effectiveMode = context.effectiveBasePermissionMode ?? "default";
+    const restoreResult = yield* attemptSetPermissionMode(context.query, effectiveMode);
+    if (Result.isSuccess(restoreResult)) {
+      return;
+    }
+    const restoreFailureCause = permissionModeControlFailureCause(restoreResult.failure);
+
+    if (
+      effectiveMode !== "bypassPermissions" ||
+      context.basePermissionMode !== "bypassPermissions" ||
+      !isBypassPermissionsUnavailableBySettingsOrConfiguration(restoreFailureCause)
+    ) {
+      return yield* toRequestError(
+        context.session.threadId,
+        "turn/setPermissionMode",
+        restoreFailureCause,
+      );
+    }
+
+    const fallbackResult = yield* attemptSetPermissionMode(context.query, "default");
+    if (Result.isFailure(fallbackResult)) {
+      return yield* toRequestError(
+        context.session.threadId,
+        "turn/setPermissionMode",
+        permissionModeControlFailureCause(fallbackResult.failure),
+      );
+    }
+
+    context.effectiveBasePermissionMode = "default";
+    if (context.fullAccessFallback === "inactive") {
+      context.fullAccessFallback = "bypass-unavailable-by-settings-or-configuration";
+      yield* Effect.logWarning("claude.permission.bypass-unavailable-host-fallback", {
+        threadId: context.session.threadId,
+        requestedPermissionMode: "bypassPermissions",
+        effectivePermissionMode: "default",
+      });
+    }
+  });
 
   const sendTurn: ClaudeAdapterShape["sendTurn"] = Effect.fn("sendTurn")(function* (input) {
     const context = yield* requireSession(input.threadId);
@@ -3751,7 +3907,7 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
 
     // Apply interaction mode by switching the SDK's permission mode.
     // "plan" maps directly to the SDK's "plan" permission mode;
-    // "default" restores the session's original permission mode.
+    // "default" restores the session's effective base permission mode.
     // When interactionMode is absent we leave the current mode unchanged.
     if (input.interactionMode === "plan") {
       yield* Effect.tryPromise({
@@ -3759,10 +3915,7 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
         catch: (cause) => toRequestError(input.threadId, "turn/setPermissionMode", cause),
       });
     } else if (input.interactionMode === "default") {
-      yield* Effect.tryPromise({
-        try: () => context.query.setPermissionMode(context.basePermissionMode ?? "default"),
-        catch: (cause) => toRequestError(input.threadId, "turn/setPermissionMode", cause),
-      });
+      yield* restoreBasePermissionMode(context);
     }
 
     const turnId = steeringTurnState?.turnId ?? TurnId.make(yield* randomUUIDv4);
