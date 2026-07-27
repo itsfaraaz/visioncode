@@ -35,6 +35,7 @@ import { parsePullRequestReference } from "../pullRequestReference";
 import { getSourceControlPresentation } from "../sourceControlPresentation";
 import {
   deriveLocalBranchNameFromRemoteRef,
+  resolveBranchToolbarPrBranch,
   resolveBranchSelectionTarget,
   resolveBranchToolbarValue,
   resolveDraftEnvModeAfterBranchChange,
@@ -591,9 +592,11 @@ export function BranchToolbarBranchSelector({
 
   // PR pill shown next to the branch selector when the active branch has one.
   const branchPr = resolveThreadPr({
-    threadBranch: resolvedActiveBranch,
+    threadBranch: resolveBranchToolbarPrBranch({
+      activeThreadBranch,
+      resolvedActiveBranch,
+    }),
     gitStatus: branchStatusQuery.data ?? null,
-    hasDedicatedWorktree: activeWorktreePath !== null,
   });
   const branchPrStatus = prStatusIndicator(branchPr, branchStatusQuery.data?.sourceControlProvider);
   // Action-oriented tooltip (the pill opens the PR), distinct from the sidebar's
@@ -731,7 +734,7 @@ export function BranchToolbarBranchSelector({
         >
           <ComboboxTrigger
             render={<Button variant="ghost" size="xs" />}
-            className="min-w-0 text-muted-foreground/70 hover:text-foreground/80"
+            className="min-w-0 max-w-full text-muted-foreground/70 hover:text-foreground/80"
             disabled={isInitialBranchesLoadPending || isBranchActionPending}
           >
             <GitBranchIcon className="size-3 shrink-0 opacity-70" />
